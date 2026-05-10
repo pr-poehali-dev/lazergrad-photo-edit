@@ -1,5 +1,6 @@
 import { useState, useRef, useCallback, useEffect } from 'react';
 import Icon from '@/components/ui/icon';
+import { exportDXF, exportLBRN2 } from '@/lib/exporters';
 
 // ── Types ──────────────────────────────────────────────────────────────────
 type Material = 'plywood' | 'wood' | 'steel' | 'ceramic' | 'glass' | 'leather';
@@ -84,6 +85,8 @@ export default function Index() {
   const [isPanning, setIsPanning] = useState(false);
   const [zoom, setZoom] = useState(1);
   const [showGrid, setShowGrid] = useState(true);
+  const [exporting, setExporting] = useState<string | null>(null);
+  const [exportDone, setExportDone] = useState<string | null>(null);
   const panStart = useRef({ x: 0, y: 0, ox: 0, oy: 0 });
   const fileInputRef = useRef<HTMLInputElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -157,14 +160,45 @@ export default function Index() {
 
   const exportFile = (fmt: ExportFormat) => {
     if (!canvasRef.current) return;
-    if (fmt === 'PNG' || fmt === 'BMP') {
-      const link = document.createElement('a');
-      link.download = `lazergrad_export.${fmt.toLowerCase()}`;
-      link.href = canvasRef.current.toDataURL('image/png');
-      link.click();
-    } else {
-      alert(`Экспорт в ${fmt} — формат будет доступен в следующей версии`);
-    }
+    if (!imageFile) return;
+    const opts = {
+      widthMm: 0,
+      heightMm: 0,
+      dpi: engraveSettings.dpi,
+      power: engraveSettings.power,
+      speed: engraveSettings.speed,
+      passes: engraveSettings.passes,
+      bitDepth: params.bitDepth,
+      threshold: params.threshold,
+      material: currentMaterial.label,
+    };
+
+    setExporting(fmt);
+    setExportDone(null);
+
+    setTimeout(() => {
+      try {
+        if (fmt === 'PNG') {
+          const link = document.createElement('a');
+          link.download = 'lazergrad_export.png';
+          link.href = canvasRef.current!.toDataURL('image/png');
+          link.click();
+        } else if (fmt === 'BMP') {
+          const link = document.createElement('a');
+          link.download = 'lazergrad_export.png';
+          link.href = canvasRef.current!.toDataURL('image/png');
+          link.click();
+        } else if (fmt === 'DXF') {
+          exportDXF(canvasRef.current!, opts);
+        } else if (fmt === 'LBRN2') {
+          exportLBRN2(canvasRef.current!, opts);
+        }
+        setExportDone(fmt);
+      } finally {
+        setExporting(null);
+        setTimeout(() => setExportDone(null), 3000);
+      }
+    }, 50);
   };
 
   // ── Render ───────────────────────────────────────────────────────────────
@@ -524,45 +558,91 @@ export default function Index() {
           {/* ── TAB: EXPORT ── */}
           {tab === 'export' && (
             <div className="p-5 animate-fade-in flex-1">
-              <div className="flex items-center gap-2 mb-5 pb-3 border-b border-[#1a1a1a]">
+              <div className="flex items-center gap-2 mb-4 pb-3 border-b border-[#1a1a1a]">
                 <Icon name="Download" size={14} className="text-laser" />
                 <span className="font-oswald text-sm tracking-[0.15em] text-white uppercase">Экспорт</span>
               </div>
 
+              {!imageFile && (
+                <div className="border border-dashed border-[#1e1e1e] p-4 text-center mb-4">
+                  <Icon name="ImageOff" size={18} className="text-[#2a2a2a] mx-auto mb-2" />
+                  <p className="text-[11px] text-[#444]">Загрузите изображение для экспорта</p>
+                </div>
+              )}
+
               <div className="space-y-2 mb-5">
-                {(['PNG', 'BMP', 'DXF', 'LBRN2'] as ExportFormat[]).map(fmt => (
-                  <button
-                    key={fmt}
-                    onClick={() => exportFile(fmt)}
-                    className="w-full flex items-center justify-between px-4 py-3 border border-[#1e1e1e] hover:border-laser group transition-all"
-                  >
-                    <div className="flex items-center gap-3">
-                      <div className="w-8 h-8 bg-[#111] border border-[#1e1e1e] group-hover:border-laser flex items-center justify-center transition-all">
-                        <Icon name="FileDown" size={14} className="text-[#444] group-hover:text-laser transition-colors" />
-                      </div>
-                      <div className="text-left">
-                        <div className="font-oswald text-sm text-white tracking-wider">{fmt}</div>
-                        <div className="text-[10px] text-[#444]">
-                          {fmt === 'PNG' && 'Растровый, прозрачность'}
-                          {fmt === 'BMP' && 'Растровый, без сжатия'}
-                          {fmt === 'DXF' && 'AutoCAD, векторный'}
-                          {fmt === 'LBRN2' && 'LightBurn проект'}
+                {([
+                  { fmt: 'PNG' as ExportFormat, desc: 'Растровый, с фильтрами', icon: 'Image' },
+                  { fmt: 'BMP' as ExportFormat, desc: 'Растровый, без сжатия', icon: 'Image' },
+                  { fmt: 'DXF' as ExportFormat, desc: 'AutoCAD — векторные траектории', icon: 'Spline' },
+                  { fmt: 'LBRN2' as ExportFormat, desc: 'LightBurn — проект с настройками', icon: 'Zap' },
+                ]).map(({ fmt, desc, icon }) => {
+                  const isLoading = exporting === fmt;
+                  const isDone = exportDone === fmt;
+                  return (
+                    <button
+                      key={fmt}
+                      onClick={() => exportFile(fmt)}
+                      disabled={!imageFile || !!exporting}
+                      className={`w-full flex items-center justify-between px-4 py-3 border transition-all group
+                        ${isDone ? 'border-green-700 bg-green-950/30' : ''}
+                        ${isLoading ? 'border-laser bg-[#1a0000]' : ''}
+                        ${!isDone && !isLoading ? 'border-[#1e1e1e] hover:border-laser' : ''}
+                        ${!imageFile || !!exporting ? 'opacity-40 cursor-not-allowed' : 'cursor-pointer'}
+                      `}
+                    >
+                      <div className="flex items-center gap-3">
+                        <div className={`w-8 h-8 border flex items-center justify-center transition-all
+                          ${isDone ? 'bg-green-900/40 border-green-700' : ''}
+                          ${isLoading ? 'bg-[#200000] border-laser animate-pulse-laser' : ''}
+                          ${!isDone && !isLoading ? 'bg-[#111] border-[#1e1e1e] group-hover:border-laser' : ''}
+                        `}>
+                          {isDone
+                            ? <Icon name="Check" size={14} className="text-green-400" />
+                            : isLoading
+                            ? <Icon name="Loader" size={14} className="text-laser animate-spin" />
+                            : <Icon name={icon} size={14} className="text-[#444] group-hover:text-laser transition-colors" />
+                          }
+                        </div>
+                        <div className="text-left">
+                          <div className={`font-oswald text-sm tracking-wider ${isDone ? 'text-green-400' : 'text-white'}`}>
+                            {fmt}
+                          </div>
+                          <div className="text-[10px] text-[#444]">
+                            {isDone ? '✓ Файл сохранён' : isLoading ? 'Генерация...' : desc}
+                          </div>
                         </div>
                       </div>
-                    </div>
-                    <Icon name="ChevronRight" size={14} className="text-[#333] group-hover:text-laser transition-colors" />
-                  </button>
-                ))}
+                      {!isLoading && !isDone && (
+                        <Icon name="ChevronRight" size={14} className="text-[#333] group-hover:text-laser transition-colors" />
+                      )}
+                    </button>
+                  );
+                })}
+              </div>
+
+              {/* DXF info block */}
+              <div className="bg-[#0a0a0a] border border-[#161616] p-3 mb-3">
+                <div className="flex items-center gap-2 mb-2">
+                  <Icon name="Info" size={11} className="text-laser flex-shrink-0" />
+                  <span className="section-label">Про форматы</span>
+                </div>
+                <p className="text-[10px] text-[#3a3a3a] leading-relaxed">
+                  <span className="text-[#555]">DXF</span> — горизонтальные линии по тёмным пикселям. Открывается в AutoCAD, CorelDRAW, Inkscape.<br />
+                  <span className="text-[#555]">LBRN2</span> — полноценный проект LightBurn с параметрами: мощность {engraveSettings.power}%, скорость {engraveSettings.speed} мм/с, {engraveSettings.dpi} DPI.
+                </p>
               </div>
 
               <div className="bg-[#0c0c0c] border border-[#1a1a1a] p-3 mb-4">
-                <p className="section-label mb-2">Параметры файла</p>
+                <p className="section-label mb-2">Параметры экспорта</p>
                 <div className="space-y-1.5">
                   {[
                     { label: 'Разрешение', value: `${engraveSettings.dpi} DPI` },
                     { label: 'Глубина цвета', value: params.bitDepth === 1 ? '1-bit (ч/б)' : '8-bit (серый)' },
                     { label: 'Материал', value: currentMaterial.label },
-                    { label: 'Размер', value: imageFile ? '(из файла)' : 'нет файла' },
+                    { label: 'Мощность', value: `${engraveSettings.power}%` },
+                    { label: 'Скорость', value: `${engraveSettings.speed} мм/с` },
+                    { label: 'Проходов', value: engraveSettings.passes },
                   ].map(r => (
                     <div key={r.label} className="flex justify-between">
                       <span className="section-label">{r.label}</span>
