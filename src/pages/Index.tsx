@@ -1,71 +1,80 @@
 import { useState, useRef, useCallback, useEffect } from 'react';
 import Icon from '@/components/ui/icon';
 import { exportDXF, exportLBRN2 } from '@/lib/exporters';
+import { processImage, renderHeightMapPreview, type HeightMapPreset, type DitheringMode, type ProcessorParams } from '@/lib/imageProcessor';
 
 // ── Types ──────────────────────────────────────────────────────────────────
 type Material = 'plywood' | 'wood' | 'steel' | 'ceramic' | 'glass' | 'leather';
 type ExportFormat = 'PNG' | 'BMP' | 'DXF' | 'LBRN2';
-type Tab = 'editor' | 'preview' | 'settings' | 'export';
-
-interface ImageParams {
-  contrast: number;
-  brightness: number;
-  sharpness: number;
-  grayscale: number;
-  threshold: number;
-  dithering: boolean;
-  bitDepth: 1 | 8;
-}
+type Tab = 'editor' | 'heightmap' | 'preview' | 'settings' | 'export';
+type PreviewMode = 'result' | 'heatmap';
 
 // ── Constants ─────────────────────────────────────────────────────────────
 const MATERIALS: { id: Material; label: string; color: string; texture: string }[] = [
-  { id: 'plywood', label: 'Фанера', color: '#c8a96e', texture: 'repeating-linear-gradient(90deg,transparent,transparent 3px,rgba(0,0,0,0.08) 3px,rgba(0,0,0,0.08) 4px)' },
-  { id: 'wood', label: 'Дерево', color: '#8b5e3c', texture: 'repeating-linear-gradient(10deg,transparent,transparent 4px,rgba(0,0,0,0.12) 4px,rgba(0,0,0,0.12) 5px)' },
-  { id: 'steel', label: 'Нержавейка', color: '#9aa0a6', texture: 'repeating-linear-gradient(135deg,rgba(255,255,255,0.06) 0,rgba(255,255,255,0.06) 1px,transparent 1px,transparent 4px)' },
-  { id: 'ceramic', label: 'Керамика', color: '#e8e0d5', texture: 'none' },
-  { id: 'glass', label: 'Стекло', color: '#b8d4e0', texture: 'repeating-linear-gradient(45deg,rgba(255,255,255,0.1) 0,rgba(255,255,255,0.1) 1px,transparent 1px,transparent 6px)' },
-  { id: 'leather', label: 'Кожа', color: '#5c3d2e', texture: 'repeating-linear-gradient(60deg,rgba(0,0,0,0.1) 0,rgba(0,0,0,0.1) 1px,transparent 1px,transparent 5px)' },
+  { id: 'plywood',  label: 'Фанера',      color: '#c8a96e', texture: 'repeating-linear-gradient(90deg,transparent,transparent 3px,rgba(0,0,0,0.08) 3px,rgba(0,0,0,0.08) 4px)' },
+  { id: 'wood',     label: 'Дерево',      color: '#8b5e3c', texture: 'repeating-linear-gradient(10deg,transparent,transparent 4px,rgba(0,0,0,0.12) 4px,rgba(0,0,0,0.12) 5px)' },
+  { id: 'steel',    label: 'Нержавейка',  color: '#9aa0a6', texture: 'repeating-linear-gradient(135deg,rgba(255,255,255,0.06) 0,rgba(255,255,255,0.06) 1px,transparent 1px,transparent 4px)' },
+  { id: 'ceramic',  label: 'Керамика',    color: '#e8e0d5', texture: 'none' },
+  { id: 'glass',    label: 'Стекло',      color: '#b8d4e0', texture: 'repeating-linear-gradient(45deg,rgba(255,255,255,0.1) 0,rgba(255,255,255,0.1) 1px,transparent 1px,transparent 6px)' },
+  { id: 'leather',  label: 'Кожа',        color: '#5c3d2e', texture: 'repeating-linear-gradient(60deg,rgba(0,0,0,0.1) 0,rgba(0,0,0,0.1) 1px,transparent 1px,transparent 5px)' },
 ];
 
-const DEFAULT_PARAMS: ImageParams = {
+const HEIGHT_MAP_PRESETS: { id: HeightMapPreset; label: string; desc: string }[] = [
+  { id: 'linear',   label: 'Линейный',   desc: 'Прямое отображение яркости в глубину' },
+  { id: 'inverted', label: 'Инверсия',   desc: 'Тёмные участки — глубже, светлые — мельче' },
+  { id: 'gamma',    label: 'Гамма-кор.', desc: 'Гамма-скорректированная глубина' },
+  { id: 'relief',   label: 'Рельеф',     desc: 'Усиление рёбер, объёмный эффект' },
+  { id: 'emboss',   label: 'Эмбосс',     desc: 'Чеканка / тиснение, диагональный перепад' },
+  { id: 'solarize', label: 'Соляриз.',   desc: 'Синусоидальная волна — двойные контуры' },
+];
+
+const DITHER_MODES: { id: DitheringMode; label: string; desc: string }[] = [
+  { id: 'none',            label: 'Нет',             desc: 'Простой порог' },
+  { id: 'threshold',       label: 'Порог',            desc: 'Жёсткий чёрно-белый' },
+  { id: 'floyd-steinberg', label: 'Флойд-Стейнберг', desc: 'Лучший для фото, диффузия ошибки' },
+  { id: 'atkinson',        label: 'Аткинсон',        desc: 'Резкий, чёткие края' },
+];
+
+const DEFAULT_PARAMS: ProcessorParams = {
   contrast: 0,
   brightness: 0,
   sharpness: 0,
   grayscale: 100,
   threshold: 128,
-  dithering: false,
   bitDepth: 8,
+  dithering: 'none',
+  heightMap: 'linear',
+  heightMapStrength: 70,
+  gamma: 1.0,
+  invert: false,
 };
 
 const ENGRAVE_SETTINGS = [
-  { id: 'power', label: 'Мощность', unit: '%', min: 1, max: 100, default: 60 },
-  { id: 'speed', label: 'Скорость', unit: 'мм/с', min: 10, max: 1000, default: 200 },
-  { id: 'dpi', label: 'DPI', unit: '', min: 75, max: 1000, default: 254 },
-  { id: 'passes', label: 'Проходов', unit: 'раз', min: 1, max: 10, default: 1 },
+  { id: 'power',  label: 'Мощность', unit: '%',    min: 1,  max: 100,  default: 60  },
+  { id: 'speed',  label: 'Скорость', unit: 'мм/с', min: 10, max: 1000, default: 200 },
+  { id: 'dpi',    label: 'DPI',      unit: '',     min: 75, max: 1000, default: 254 },
+  { id: 'passes', label: 'Проходов', unit: 'раз',  min: 1,  max: 10,   default: 1   },
 ];
 
 // ── Slider ────────────────────────────────────────────────────────────────
-function Slider({ label, value, min, max, unit = '', onChange }: {
-  label: string; value: number; min: number; max: number; unit?: string; onChange: (v: number) => void;
+function Slider({ label, value, min, max, unit = '', step = 1, onChange }: {
+  label: string; value: number; min: number; max: number; unit?: string; step?: number; onChange: (v: number) => void;
 }) {
   return (
     <div className="mb-4">
       <div className="flex justify-between items-center mb-1">
         <span className="section-label">{label}</span>
-        <span className="value-mono">{value}{unit}</span>
+        <span className="value-mono">{typeof value === 'number' ? value.toFixed(step < 1 ? 1 : 0) : value}{unit}</span>
       </div>
       <input
-        type="range"
-        min={min}
-        max={max}
-        value={value}
+        type="range" min={min} max={max} step={step} value={value}
         onChange={e => onChange(Number(e.target.value))}
-        className="w-full h-1 bg-[#1e1e1e] appearance-none cursor-pointer slider-laser"
+        className="w-full h-1 bg-[#1e1e1e] appearance-none cursor-pointer"
         style={{ accentColor: 'var(--laser)' }}
       />
       <div className="flex justify-between mt-0.5">
-        <span className="text-[10px] text-[#333]">{min}</span>
-        <span className="text-[10px] text-[#333]">{max}</span>
+        <span className="text-[10px] text-[#2e2e2e]">{min}</span>
+        <span className="text-[10px] text-[#2e2e2e]">{max}</span>
       </div>
     </div>
   );
@@ -74,7 +83,7 @@ function Slider({ label, value, min, max, unit = '', onChange }: {
 // ── Main Component ────────────────────────────────────────────────────────
 export default function Index() {
   const [tab, setTab] = useState<Tab>('editor');
-  const [params, setParams] = useState<ImageParams>(DEFAULT_PARAMS);
+  const [params, setParams] = useState<ProcessorParams>(DEFAULT_PARAMS);
   const [material, setMaterial] = useState<Material>('plywood');
   const [imageFile, setImageFile] = useState<string | null>(null);
   const [imageName, setImageName] = useState<string>('');
@@ -87,12 +96,32 @@ export default function Index() {
   const [showGrid, setShowGrid] = useState(true);
   const [exporting, setExporting] = useState<string | null>(null);
   const [exportDone, setExportDone] = useState<string | null>(null);
+  const [previewMode, setPreviewMode] = useState<PreviewMode>('result');
+
   const panStart = useRef({ x: 0, y: 0, ox: 0, oy: 0 });
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const canvasRef = useRef<HTMLCanvasElement>(null);
+  // source canvas: raw image loaded here
+  const sourceCanvasRef = useRef<HTMLCanvasElement>(null);
+  // output canvas: processed result shown on screen
+  const outputCanvasRef = useRef<HTMLCanvasElement>(null);
+  // heatmap canvas
+  const heatCanvasRef = useRef<HTMLCanvasElement>(null);
 
-  const param = <K extends keyof ImageParams>(key: K, value: ImageParams[K]) =>
+  const setParam = <K extends keyof ProcessorParams>(key: K, value: ProcessorParams[K]) =>
     setParams(p => ({ ...p, [key]: value }));
+
+  // Load source image into hidden source canvas
+  const loadSource = useCallback((url: string) => {
+    const canvas = sourceCanvasRef.current!;
+    const ctx = canvas.getContext('2d')!;
+    const img = new Image();
+    img.onload = () => {
+      canvas.width = img.width;
+      canvas.height = img.height;
+      ctx.drawImage(img, 0, 0);
+    };
+    img.src = url;
+  }, []);
 
   const handleFile = useCallback((file: File) => {
     const url = URL.createObjectURL(file);
@@ -100,7 +129,8 @@ export default function Index() {
     setImageName(file.name);
     setPanOffset({ x: 0, y: 0 });
     setZoom(1);
-  }, []);
+    setTimeout(() => loadSource(url), 50);
+  }, [loadSource]);
 
   const onDrop = useCallback((e: React.DragEvent) => {
     e.preventDefault();
@@ -108,35 +138,30 @@ export default function Index() {
     if (file && file.type.startsWith('image/')) handleFile(file);
   }, [handleFile]);
 
-  // Apply filters to canvas for preview
+  // Re-process whenever params or image changes
   useEffect(() => {
-    if (!canvasRef.current || !imageFile) return;
-    const canvas = canvasRef.current;
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
-    const img = new Image();
-    img.onload = () => {
-      canvas.width = img.width;
-      canvas.height = img.height;
-      ctx.filter = [
-        `contrast(${100 + params.contrast}%)`,
-        `brightness(${100 + params.brightness}%)`,
-        `saturate(${100 - params.grayscale}%)`,
-        `grayscale(${params.grayscale}%)`,
-      ].join(' ');
-      ctx.drawImage(img, 0, 0);
-      if (params.bitDepth === 1) {
-        const d = ctx.getImageData(0, 0, canvas.width, canvas.height);
-        for (let i = 0; i < d.data.length; i += 4) {
-          const lum = 0.299 * d.data[i] + 0.587 * d.data[i+1] + 0.114 * d.data[i+2];
-          const v = lum >= params.threshold ? 255 : 0;
-          d.data[i] = d.data[i+1] = d.data[i+2] = v;
+    if (!imageFile || !sourceCanvasRef.current || !outputCanvasRef.current) return;
+    if (sourceCanvasRef.current.width === 0) return;
+    processImage(sourceCanvasRef.current, outputCanvasRef.current, params);
+    if (heatCanvasRef.current) {
+      renderHeightMapPreview(sourceCanvasRef.current, heatCanvasRef.current, params);
+    }
+  }, [params, imageFile]);
+
+  // Re-process after source canvas is ready
+  useEffect(() => {
+    if (!imageFile) return;
+    const id = setTimeout(() => {
+      if (sourceCanvasRef.current && outputCanvasRef.current && sourceCanvasRef.current.width > 0) {
+        processImage(sourceCanvasRef.current, outputCanvasRef.current, params);
+        if (heatCanvasRef.current) {
+          renderHeightMapPreview(sourceCanvasRef.current, heatCanvasRef.current, params);
         }
-        ctx.putImageData(d, 0, 0);
       }
-    };
-    img.src = imageFile;
-  }, [imageFile, params]);
+    }, 120);
+    return () => clearTimeout(id);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [imageFile]);
 
   const handleMouseDown = (e: React.MouseEvent) => {
     setIsPanning(true);
@@ -150,7 +175,6 @@ export default function Index() {
     });
   };
   const handleMouseUp = () => setIsPanning(false);
-
   const handleWheel = (e: React.WheelEvent) => {
     e.preventDefault();
     setZoom(z => Math.min(8, Math.max(0.1, z - e.deltaY * 0.001)));
@@ -159,11 +183,9 @@ export default function Index() {
   const currentMaterial = MATERIALS.find(m => m.id === material)!;
 
   const exportFile = (fmt: ExportFormat) => {
-    if (!canvasRef.current) return;
-    if (!imageFile) return;
+    if (!outputCanvasRef.current || !imageFile) return;
     const opts = {
-      widthMm: 0,
-      heightMm: 0,
+      widthMm: 0, heightMm: 0,
       dpi: engraveSettings.dpi,
       power: engraveSettings.power,
       speed: engraveSettings.speed,
@@ -172,26 +194,19 @@ export default function Index() {
       threshold: params.threshold,
       material: currentMaterial.label,
     };
-
     setExporting(fmt);
     setExportDone(null);
-
     setTimeout(() => {
       try {
-        if (fmt === 'PNG') {
+        if (fmt === 'PNG' || fmt === 'BMP') {
           const link = document.createElement('a');
-          link.download = 'lazergrad_export.png';
-          link.href = canvasRef.current!.toDataURL('image/png');
-          link.click();
-        } else if (fmt === 'BMP') {
-          const link = document.createElement('a');
-          link.download = 'lazergrad_export.png';
-          link.href = canvasRef.current!.toDataURL('image/png');
+          link.download = `lazergrad_export.png`;
+          link.href = outputCanvasRef.current!.toDataURL('image/png');
           link.click();
         } else if (fmt === 'DXF') {
-          exportDXF(canvasRef.current!, opts);
+          exportDXF(outputCanvasRef.current!, opts);
         } else if (fmt === 'LBRN2') {
-          exportLBRN2(canvasRef.current!, opts);
+          exportLBRN2(outputCanvasRef.current!, opts);
         }
         setExportDone(fmt);
       } finally {
@@ -201,9 +216,17 @@ export default function Index() {
     }, 50);
   };
 
+  // Active display canvas
+  const displayCanvas = previewMode === 'heatmap' ? heatCanvasRef : outputCanvasRef;
+
   // ── Render ───────────────────────────────────────────────────────────────
   return (
     <div className="min-h-screen bg-[#0f0f0f] flex flex-col relative overflow-hidden">
+
+      {/* Hidden source canvas */}
+      <canvas ref={sourceCanvasRef} className="hidden" />
+      {/* Hidden heatmap canvas */}
+      <canvas ref={heatCanvasRef} className="hidden" />
 
       {/* ── Header ── */}
       <header className="relative z-10 flex items-center justify-between px-6 py-3 border-b border-[#1e1e1e] bg-[#0a0a0a]">
@@ -220,21 +243,19 @@ export default function Index() {
           </div>
         </div>
 
-        {/* Nav tabs */}
         <nav className="flex gap-0 border border-[#1e1e1e]">
           {([
-            { id: 'editor', icon: 'SlidersHorizontal', label: 'РЕДАКТОР' },
-            { id: 'preview', icon: 'Eye', label: 'МАТЕРИАЛ' },
-            { id: 'settings', icon: 'Settings2', label: 'НАСТРОЙКИ' },
-            { id: 'export', icon: 'Download', label: 'ЭКСПОРТ' },
+            { id: 'editor',    icon: 'SlidersHorizontal', label: 'РЕДАКТОР' },
+            { id: 'heightmap', icon: 'Mountain',          label: 'ВЫСОТЫ' },
+            { id: 'preview',   icon: 'Eye',               label: 'МАТЕРИАЛ' },
+            { id: 'settings',  icon: 'Settings2',         label: 'НАСТРОЙКИ' },
+            { id: 'export',    icon: 'Download',          label: 'ЭКСПОРТ' },
           ] as const).map(t => (
             <button
               key={t.id}
               onClick={() => setTab(t.id)}
               className={`flex items-center gap-2 px-4 py-2 text-[11px] font-oswald font-medium tracking-[0.12em] transition-all ${
-                tab === t.id
-                  ? 'bg-laser text-white'
-                  : 'text-[#555] hover:text-[#aaa] hover:bg-[#141414]'
+                tab === t.id ? 'bg-laser text-white' : 'text-[#555] hover:text-[#aaa] hover:bg-[#141414]'
               }`}
             >
               <Icon name={t.icon} size={12} />
@@ -243,7 +264,7 @@ export default function Index() {
           ))}
         </nav>
 
-        <div className="flex items-center gap-2 text-[#333]">
+        <div className="flex items-center gap-2">
           <div className="h-1.5 w-1.5 rounded-full bg-laser animate-pulse-laser" />
           <span className="text-[10px] font-mono text-[#444]">SYS ONLINE</span>
         </div>
@@ -252,12 +273,44 @@ export default function Index() {
       {/* ── Body ── */}
       <div className="flex flex-1 overflow-hidden relative z-10">
 
-        {/* LEFT — Upload / Canvas */}
+        {/* LEFT — Canvas */}
         <div className="flex-1 flex flex-col border-r border-[#1a1a1a]">
 
-          {/* Canvas area */}
+          {/* Preview mode toggle */}
+          {imageFile && (
+            <div className="flex items-center gap-0 border-b border-[#181818] bg-[#0c0c0c] px-4 py-2">
+              <span className="section-label mr-4">РЕЖИМ ПРОСМОТРА:</span>
+              {([
+                { id: 'result',  label: 'Результат', icon: 'ScanLine' },
+                { id: 'heatmap', label: 'Карта высот', icon: 'Thermometer' },
+              ] as const).map(m => (
+                <button
+                  key={m.id}
+                  onClick={() => setPreviewMode(m.id)}
+                  className={`flex items-center gap-1.5 px-3 py-1 text-[10px] font-oswald tracking-wider mr-1 transition-all border ${
+                    previewMode === m.id
+                      ? 'border-laser text-laser bg-[#150000]'
+                      : 'border-[#1e1e1e] text-[#444] hover:border-[#333] hover:text-[#777]'
+                  }`}
+                >
+                  <Icon name={m.icon} size={11} />
+                  {m.label.toUpperCase()}
+                </button>
+              ))}
+              {previewMode === 'heatmap' && (
+                <div className="ml-auto flex items-center gap-1">
+                  {/* Thermal gradient legend */}
+                  <div className="w-24 h-2 rounded-sm" style={{
+                    background: 'linear-gradient(to right, #0a0a1e, #1414b4, #00c8b4, #c8dc00, #ff3c00)'
+                  }} />
+                  <span className="text-[9px] text-[#333] ml-1">0%→100%</span>
+                </div>
+              )}
+            </div>
+          )}
+
           <div
-            className="flex-1 relative overflow-hidden bg-[#0c0c0c] cursor-crosshair select-none"
+            className="flex-1 relative overflow-hidden bg-[#0c0c0c] select-none"
             onDrop={onDrop}
             onDragOver={e => e.preventDefault()}
             onMouseDown={handleMouseDown}
@@ -265,19 +318,15 @@ export default function Index() {
             onMouseUp={handleMouseUp}
             onMouseLeave={handleMouseUp}
             onWheel={handleWheel}
+            style={{ cursor: isPanning ? 'grabbing' : imageFile ? 'grab' : 'default' }}
           >
-            {/* Grid */}
             {showGrid && (
-              <div
-                className="absolute inset-0 pointer-events-none opacity-[0.06]"
-                style={{
-                  backgroundImage: 'linear-gradient(#e8000a 1px,transparent 1px),linear-gradient(90deg,#e8000a 1px,transparent 1px)',
-                  backgroundSize: '40px 40px',
-                }}
-              />
+              <div className="absolute inset-0 pointer-events-none opacity-[0.05]" style={{
+                backgroundImage: 'linear-gradient(#e8000a 1px,transparent 1px),linear-gradient(90deg,#e8000a 1px,transparent 1px)',
+                backgroundSize: '40px 40px',
+              }} />
             )}
 
-            {/* Crosshair */}
             {!imageFile && (
               <div className="absolute inset-0 flex flex-col items-center justify-center gap-6">
                 <div className="relative">
@@ -288,59 +337,65 @@ export default function Index() {
                     <div className="absolute bottom-0 right-0 w-4 h-4 border-b border-r border-laser" />
                     <Icon name="ImagePlus" size={28} className="text-[#333]" />
                   </div>
-                  <div className="absolute -inset-4 border border-dashed border-[#1a1a1a]" />
                 </div>
                 <div className="text-center">
                   <p className="font-oswald text-[#444] text-sm tracking-[0.2em] uppercase mb-1">Загрузить изображение</p>
                   <p className="text-[10px] text-[#2a2a2a] tracking-widest">Перетащите файл или нажмите кнопку</p>
                 </div>
-                <button
-                  onClick={() => fileInputRef.current?.click()}
-                  className="btn-laser px-6 py-2 text-xs"
-                >
-                  <Icon name="Upload" size={12} className="inline mr-2" />
-                  Выбрать файл
+                <button onClick={() => fileInputRef.current?.click()} className="btn-laser px-6 py-2 text-xs">
+                  <Icon name="Upload" size={12} className="inline mr-2" />Выбрать файл
                 </button>
               </div>
             )}
 
-            {/* Image canvas */}
             {imageFile && (
-              <div
-                className="absolute inset-0 flex items-center justify-center"
-                style={{ cursor: isPanning ? 'grabbing' : 'grab' }}
-              >
+              <div className="absolute inset-0 flex items-center justify-center">
                 <div style={{ transform: `translate(${panOffset.x}px,${panOffset.y}px) scale(${zoom})`, transition: isPanning ? 'none' : 'transform 0.05s' }}>
+                  {/* Output canvas (always rendered but hidden when heatmap active) */}
                   <canvas
-                    ref={canvasRef}
+                    ref={outputCanvasRef}
                     className="block max-w-none"
-                    style={{ imageRendering: params.bitDepth === 1 ? 'pixelated' : 'auto', maxHeight: '70vh', maxWidth: '100%' }}
+                    style={{
+                      display: previewMode === 'result' ? 'block' : 'none',
+                      imageRendering: params.bitDepth === 1 ? 'pixelated' : 'auto',
+                      maxHeight: '70vh',
+                    }}
                   />
+                  {/* Heatmap display */}
+                  {previewMode === 'heatmap' && (
+                    <canvas
+                      ref={node => {
+                        if (node && heatCanvasRef.current) {
+                          // Mirror heatmap canvas content onto this display node
+                          const ctx = node.getContext('2d');
+                          const src = heatCanvasRef.current;
+                          if (ctx && src.width > 0) {
+                            node.width = src.width;
+                            node.height = src.height;
+                            ctx.drawImage(src, 0, 0);
+                          }
+                        }
+                      }}
+                      className="block max-w-none"
+                      style={{ maxHeight: '70vh' }}
+                    />
+                  )}
                 </div>
               </div>
             )}
 
-            {/* Zoom / Tools bar */}
+            {/* Zoom bar */}
             {imageFile && (
               <div className="absolute bottom-4 left-4 flex items-center gap-2">
-                <button onClick={() => setZoom(z => Math.min(8, z + 0.25))} className="btn-ghost-steel w-7 h-7 flex items-center justify-center">
-                  <Icon name="ZoomIn" size={12} />
-                </button>
+                <button onClick={() => setZoom(z => Math.min(8, z + 0.25))} className="btn-ghost-steel w-7 h-7 flex items-center justify-center"><Icon name="ZoomIn" size={12} /></button>
                 <span className="value-mono text-xs">{Math.round(zoom * 100)}%</span>
-                <button onClick={() => setZoom(z => Math.max(0.1, z - 0.25))} className="btn-ghost-steel w-7 h-7 flex items-center justify-center">
-                  <Icon name="ZoomOut" size={12} />
-                </button>
-                <button onClick={() => { setZoom(1); setPanOffset({ x: 0, y: 0 }); }} className="btn-ghost-steel px-2 h-7 text-[10px] font-mono">
-                  СБРОС
-                </button>
+                <button onClick={() => setZoom(z => Math.max(0.1, z - 0.25))} className="btn-ghost-steel w-7 h-7 flex items-center justify-center"><Icon name="ZoomOut" size={12} /></button>
+                <button onClick={() => { setZoom(1); setPanOffset({ x: 0, y: 0 }); }} className="btn-ghost-steel px-2 h-7 text-[10px] font-mono">СБРОС</button>
               </div>
             )}
 
             <div className="absolute bottom-4 right-4 flex items-center gap-2">
-              <button
-                onClick={() => setShowGrid(g => !g)}
-                className={`btn-ghost-steel w-7 h-7 flex items-center justify-center ${showGrid ? 'border-[#333] text-[#666]' : ''}`}
-              >
+              <button onClick={() => setShowGrid(g => !g)} className={`btn-ghost-steel w-7 h-7 flex items-center justify-center ${showGrid ? 'border-[#333]' : ''}`}>
                 <Icon name="Grid3x3" size={12} />
               </button>
               {imageFile && (
@@ -350,7 +405,6 @@ export default function Index() {
               )}
             </div>
 
-            {/* File name badge */}
             {imageName && (
               <div className="absolute top-3 left-3 px-2 py-1 bg-[#0f0f0f] border border-[#1e1e1e]">
                 <span className="text-[10px] font-mono text-[#555]">{imageName}</span>
@@ -359,34 +413,45 @@ export default function Index() {
           </div>
         </div>
 
-        {/* RIGHT — Controls panel */}
+        {/* RIGHT — Control panel */}
         <aside className="w-72 flex-shrink-0 bg-[#0e0e0e] flex flex-col overflow-y-auto">
 
-          {/* ── TAB: EDITOR ── */}
+          {/* ── EDITOR ── */}
           {tab === 'editor' && (
-            <div className="p-5 animate-fade-in flex-1">
+            <div className="p-5 animate-fade-in">
               <div className="flex items-center gap-2 mb-5 pb-3 border-b border-[#1a1a1a]">
                 <Icon name="SlidersHorizontal" size={14} className="text-laser" />
-                <span className="font-oswald text-sm tracking-[0.15em] text-white uppercase">Параметры</span>
+                <span className="font-oswald text-sm tracking-[0.15em] text-white uppercase">Коррекция</span>
               </div>
 
-              <Slider label="Контрастность" value={params.contrast} min={-100} max={100} unit="" onChange={v => param('contrast', v)} />
-              <Slider label="Яркость" value={params.brightness} min={-100} max={100} onChange={v => param('brightness', v)} />
-              <Slider label="Резкость" value={params.sharpness} min={0} max={100} onChange={v => param('sharpness', v)} />
-              <Slider label="Уровень серого" value={params.grayscale} min={0} max={100} unit="%" onChange={v => param('grayscale', v)} />
+              <Slider label="Контрастность" value={params.contrast}    min={-100} max={100} onChange={v => setParam('contrast', v)} />
+              <Slider label="Яркость"        value={params.brightness}  min={-100} max={100} onChange={v => setParam('brightness', v)} />
+              <Slider label="Резкость"        value={params.sharpness}   min={0}    max={100} onChange={v => setParam('sharpness', v)} />
+              <Slider label="Уровень серого"  value={params.grayscale}   min={0}    max={100} unit="%" onChange={v => setParam('grayscale', v)} />
+              <Slider label="Гамма"           value={params.gamma}       min={0.1}  max={3.0} step={0.1} onChange={v => setParam('gamma', v)} />
 
               <div className="border-t border-[#1a1a1a] my-4" />
 
+              {/* Invert */}
+              <div className="mb-4 flex items-center justify-between">
+                <span className="section-label">Инверсия (негатив)</span>
+                <button
+                  onClick={() => setParam('invert', !params.invert)}
+                  className={`w-10 h-5 relative transition-all ${params.invert ? 'bg-laser' : 'bg-[#1e1e1e] border border-[#2e2e2e]'}`}
+                >
+                  <div className={`absolute top-0.5 w-4 h-4 bg-white transition-all ${params.invert ? 'right-0.5' : 'left-0.5'}`} />
+                </button>
+              </div>
+
+              {/* Bit depth */}
               <div className="mb-4">
                 <span className="section-label block mb-2">Режим вывода</span>
                 <div className="flex gap-2">
                   {([8, 1] as const).map(b => (
                     <button
                       key={b}
-                      onClick={() => param('bitDepth', b)}
-                      className={`flex-1 py-1.5 text-xs font-oswald tracking-wider transition-all ${
-                        params.bitDepth === b ? 'btn-laser' : 'btn-ghost-steel'
-                      }`}
+                      onClick={() => setParam('bitDepth', b)}
+                      className={`flex-1 py-1.5 text-xs font-oswald tracking-wider transition-all ${params.bitDepth === b ? 'btn-laser' : 'btn-ghost-steel'}`}
                     >
                       {b === 8 ? '8 BIT' : '1 BIT'}
                     </button>
@@ -395,32 +460,126 @@ export default function Index() {
               </div>
 
               {params.bitDepth === 1 && (
-                <Slider label="Порог (Threshold)" value={params.threshold} min={0} max={255} onChange={v => param('threshold', v)} />
+                <>
+                  <Slider label="Порог" value={params.threshold} min={0} max={255} onChange={v => setParam('threshold', v)} />
+
+                  <div className="mb-4">
+                    <span className="section-label block mb-2">Дизеринг</span>
+                    <div className="flex flex-col gap-1">
+                      {DITHER_MODES.map(d => (
+                        <button
+                          key={d.id}
+                          onClick={() => setParam('dithering', d.id)}
+                          className={`text-left px-3 py-2 border transition-all ${
+                            params.dithering === d.id
+                              ? 'border-laser bg-[#150000] text-white'
+                              : 'border-[#1a1a1a] text-[#555] hover:border-[#2e2e2e] hover:text-[#888]'
+                          }`}
+                        >
+                          <div className="flex items-center justify-between">
+                            <span className="font-oswald text-xs tracking-wide">{d.label}</span>
+                            {params.dithering === d.id && <Icon name="Check" size={10} className="text-laser" />}
+                          </div>
+                          <div className="text-[9px] text-[#3a3a3a] mt-0.5">{d.desc}</div>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                </>
               )}
 
-              <div className="mb-4 flex items-center justify-between">
-                <span className="section-label">Дизеринг</span>
-                <button
-                  onClick={() => param('dithering', !params.dithering)}
-                  className={`w-10 h-5 relative transition-all ${params.dithering ? 'bg-laser' : 'bg-[#1e1e1e] border border-[#2e2e2e]'}`}
-                >
-                  <div className={`absolute top-0.5 w-4 h-4 bg-white transition-all ${params.dithering ? 'right-0.5' : 'left-0.5'}`} />
-                </button>
-              </div>
-
-              <button
-                onClick={() => setParams(DEFAULT_PARAMS)}
-                className="btn-ghost-steel w-full py-2 text-xs mt-2"
-              >
-                <Icon name="RotateCcw" size={10} className="inline mr-1.5" />
-                Сбросить всё
+              <button onClick={() => setParams(DEFAULT_PARAMS)} className="btn-ghost-steel w-full py-2 text-xs mt-2">
+                <Icon name="RotateCcw" size={10} className="inline mr-1.5" />Сбросить всё
               </button>
             </div>
           )}
 
-          {/* ── TAB: PREVIEW (MATERIAL) ── */}
+          {/* ── HEIGHT MAP ── */}
+          {tab === 'heightmap' && (
+            <div className="p-5 animate-fade-in">
+              <div className="flex items-center gap-2 mb-4 pb-3 border-b border-[#1a1a1a]">
+                <Icon name="Mountain" size={14} className="text-laser" />
+                <span className="font-oswald text-sm tracking-[0.15em] text-white uppercase">Карта высот</span>
+              </div>
+
+              {/* Info block */}
+              <div className="bg-[#0a0a0a] border border-[#161616] p-3 mb-4">
+                <p className="text-[10px] text-[#3a3a3a] leading-relaxed">
+                  Карта высот определяет, как яркость пикселей преобразуется в глубину гравировки.
+                  Визуализация — тепловая карта: <span className="text-blue-500">синий</span> = мелко,
+                  <span className="text-red-500"> красный</span> = глубоко.
+                </p>
+              </div>
+
+              {/* Presets */}
+              <span className="section-label block mb-2">Профиль карты высот</span>
+              <div className="flex flex-col gap-1.5 mb-4">
+                {HEIGHT_MAP_PRESETS.map(preset => (
+                  <button
+                    key={preset.id}
+                    onClick={() => { setParam('heightMap', preset.id); setPreviewMode('heatmap'); }}
+                    className={`text-left px-3 py-2.5 border transition-all ${
+                      params.heightMap === preset.id
+                        ? 'border-laser bg-[#150000]'
+                        : 'border-[#1a1a1a] hover:border-[#2e2e2e]'
+                    }`}
+                  >
+                    <div className="flex items-center justify-between mb-0.5">
+                      <span className={`font-oswald text-xs tracking-wider ${params.heightMap === preset.id ? 'text-laser' : 'text-[#888]'}`}>
+                        {preset.label}
+                      </span>
+                      {params.heightMap === preset.id && (
+                        <div className="w-1.5 h-1.5 rounded-full bg-laser animate-pulse-laser" />
+                      )}
+                    </div>
+                    <div className="text-[9px] text-[#3a3a3a]">{preset.desc}</div>
+                  </button>
+                ))}
+              </div>
+
+              <Slider
+                label="Сила эффекта"
+                value={params.heightMapStrength}
+                min={0} max={100} unit="%"
+                onChange={v => setParam('heightMapStrength', v)}
+              />
+
+              {/* Depth gradient visual */}
+              <div className="mb-4">
+                <span className="section-label block mb-2">Визуализация глубины</span>
+                <div className="relative h-8 w-full overflow-hidden border border-[#1e1e1e]">
+                  <div className="absolute inset-0" style={{
+                    background: 'linear-gradient(to right, #0a0a1e, #1414b4, #00c8b4, #c8dc00, #ff3c00)'
+                  }} />
+                  <div className="absolute inset-0 flex items-center justify-between px-2">
+                    <span className="text-[9px] text-white/60 font-mono">МЕЛКО</span>
+                    <span className="text-[9px] text-white/60 font-mono">ГЛУБОКО</span>
+                  </div>
+                </div>
+                <div className="flex justify-between mt-1">
+                  <span className="text-[9px] text-[#2a2a2a]">0%</span>
+                  <span className="text-[9px] text-[#2a2a2a]">25%</span>
+                  <span className="text-[9px] text-[#2a2a2a]">50%</span>
+                  <span className="text-[9px] text-[#2a2a2a]">75%</span>
+                  <span className="text-[9px] text-[#2a2a2a]">100%</span>
+                </div>
+              </div>
+
+              <button
+                onClick={() => setPreviewMode(m => m === 'heatmap' ? 'result' : 'heatmap')}
+                className={`w-full py-2 text-xs font-oswald tracking-wider border transition-all ${
+                  previewMode === 'heatmap' ? 'btn-laser' : 'btn-ghost-steel'
+                }`}
+              >
+                <Icon name="Thermometer" size={11} className="inline mr-1.5" />
+                {previewMode === 'heatmap' ? 'СКРЫТЬ ТЕПЛОВУЮ КАРТУ' : 'ПОКАЗАТЬ ТЕПЛОВУЮ КАРТУ'}
+              </button>
+            </div>
+          )}
+
+          {/* ── MATERIAL PREVIEW ── */}
           {tab === 'preview' && (
-            <div className="p-5 animate-fade-in flex-1">
+            <div className="p-5 animate-fade-in">
               <div className="flex items-center gap-2 mb-5 pb-3 border-b border-[#1a1a1a]">
                 <Icon name="Layers" size={14} className="text-laser" />
                 <span className="font-oswald text-sm tracking-[0.15em] text-white uppercase">Материал</span>
@@ -431,9 +590,7 @@ export default function Index() {
                   <button
                     key={m.id}
                     onClick={() => setMaterial(m.id)}
-                    className={`relative overflow-hidden h-16 transition-all ${
-                      material === m.id ? 'ring-1 ring-laser' : 'ring-1 ring-[#1e1e1e] hover:ring-[#333]'
-                    }`}
+                    className={`relative overflow-hidden h-16 transition-all ${material === m.id ? 'ring-1 ring-laser' : 'ring-1 ring-[#1e1e1e] hover:ring-[#333]'}`}
                     style={{ background: m.color }}
                   >
                     <div className="absolute inset-0" style={{ backgroundImage: m.texture }} />
@@ -449,22 +606,21 @@ export default function Index() {
                 ))}
               </div>
 
-              {/* Material preview overlay */}
               <div className="border border-[#1e1e1e] mb-4 relative overflow-hidden">
                 <div className="section-label px-3 py-2 border-b border-[#1e1e1e]">Предпросмотр на {currentMaterial.label}</div>
-                <div
-                  className="h-40 relative scanlines flex items-center justify-center"
-                  style={{ background: currentMaterial.color }}
-                >
+                <div className="h-40 relative scanlines flex items-center justify-center" style={{ background: currentMaterial.color }}>
                   <div className="absolute inset-0" style={{ backgroundImage: currentMaterial.texture }} />
                   {imageFile ? (
-                    <img
-                      src={imageFile}
-                      alt="preview"
-                      className="absolute inset-0 w-full h-full object-contain mix-blend-multiply opacity-80"
-                      style={{
-                        filter: `contrast(${100 + params.contrast}%) brightness(${100 + params.brightness}%) grayscale(${params.grayscale}%)`,
+                    <canvas
+                      ref={node => {
+                        if (node && outputCanvasRef.current && outputCanvasRef.current.width > 0) {
+                          node.width = outputCanvasRef.current.width;
+                          node.height = outputCanvasRef.current.height;
+                          node.getContext('2d')?.drawImage(outputCanvasRef.current, 0, 0);
+                        }
                       }}
+                      className="absolute inset-0 w-full h-full object-contain mix-blend-multiply opacity-80"
+                      style={{ objectFit: 'contain' }}
                     />
                   ) : (
                     <span className="text-[10px] text-black/30 font-mono relative z-10">НЕТ ИЗОБРАЖЕНИЯ</span>
@@ -473,17 +629,19 @@ export default function Index() {
               </div>
 
               <div className="bg-[#0c0c0c] border border-[#1a1a1a] p-3">
-                <p className="section-label mb-2">Параметры материала</p>
-                <div className="grid grid-cols-2 gap-x-4 gap-y-1">
+                <p className="section-label mb-2">Параметры</p>
+                <div className="grid grid-cols-2 gap-x-4 gap-y-1.5">
                   {[
-                    { label: 'Материал', value: currentMaterial.label },
-                    { label: 'DPI', value: engraveSettings.dpi },
-                    { label: 'Мощность', value: `${engraveSettings.power}%` },
-                    { label: 'Скорость', value: `${engraveSettings.speed} мм/с` },
+                    { label: 'Материал',  value: currentMaterial.label },
+                    { label: 'DPI',       value: engraveSettings.dpi },
+                    { label: 'Мощность',  value: `${engraveSettings.power}%` },
+                    { label: 'Скорость',  value: `${engraveSettings.speed} мм/с` },
+                    { label: 'Карта',     value: HEIGHT_MAP_PRESETS.find(h => h.id === params.heightMap)?.label },
+                    { label: 'Дизеринг', value: params.bitDepth === 1 ? DITHER_MODES.find(d => d.id === params.dithering)?.label : '—' },
                   ].map(r => (
                     <div key={r.label}>
                       <div className="section-label">{r.label}</div>
-                      <div className="value-mono">{r.value}</div>
+                      <div className="value-mono text-[#888]">{r.value}</div>
                     </div>
                   ))}
                 </div>
@@ -491,9 +649,9 @@ export default function Index() {
             </div>
           )}
 
-          {/* ── TAB: SETTINGS ── */}
+          {/* ── SETTINGS ── */}
           {tab === 'settings' && (
-            <div className="p-5 animate-fade-in flex-1">
+            <div className="p-5 animate-fade-in">
               <div className="flex items-center gap-2 mb-5 pb-3 border-b border-[#1a1a1a]">
                 <Icon name="Settings2" size={14} className="text-laser" />
                 <span className="font-oswald text-sm tracking-[0.15em] text-white uppercase">Гравировка</span>
@@ -504,8 +662,7 @@ export default function Index() {
                   key={s.id}
                   label={s.label}
                   value={engraveSettings[s.id]}
-                  min={s.min}
-                  max={s.max}
+                  min={s.min} max={s.max}
                   unit={s.unit ? ` ${s.unit}` : ''}
                   onChange={v => setEngraveSettings(prev => ({ ...prev, [s.id]: v }))}
                 />
@@ -518,32 +675,12 @@ export default function Index() {
                 <div className="flex gap-2">
                   <div className="flex-1">
                     <div className="section-label mb-1">Ширина (мм)</div>
-                    <input
-                      type="number"
-                      defaultValue={300}
-                      className="w-full bg-[#0c0c0c] border border-[#1e1e1e] text-[#888] font-mono text-xs px-2 py-1.5 outline-none focus:border-laser"
-                    />
+                    <input type="number" defaultValue={300} className="w-full bg-[#0c0c0c] border border-[#1e1e1e] text-[#888] font-mono text-xs px-2 py-1.5 outline-none focus:border-laser" />
                   </div>
                   <div className="flex-1">
                     <div className="section-label mb-1">Высота (мм)</div>
-                    <input
-                      type="number"
-                      defaultValue={200}
-                      className="w-full bg-[#0c0c0c] border border-[#1e1e1e] text-[#888] font-mono text-xs px-2 py-1.5 outline-none focus:border-laser"
-                    />
+                    <input type="number" defaultValue={200} className="w-full bg-[#0c0c0c] border border-[#1e1e1e] text-[#888] font-mono text-xs px-2 py-1.5 outline-none focus:border-laser" />
                   </div>
-                </div>
-              </div>
-
-              <div className="mb-4">
-                <span className="section-label block mb-2">Тип гравировки</span>
-                <div className="flex flex-col gap-1.5">
-                  {['Растровая (bitmap)', 'Векторная (contour)', 'Комбинированная'].map(t => (
-                    <button key={t} className="btn-ghost-steel text-left px-3 py-2 text-[11px] flex items-center gap-2">
-                      <div className="w-1.5 h-1.5 rounded-full bg-laser flex-shrink-0" />
-                      {t}
-                    </button>
-                  ))}
                 </div>
               </div>
 
@@ -555,9 +692,9 @@ export default function Index() {
             </div>
           )}
 
-          {/* ── TAB: EXPORT ── */}
+          {/* ── EXPORT ── */}
           {tab === 'export' && (
-            <div className="p-5 animate-fade-in flex-1">
+            <div className="p-5 animate-fade-in">
               <div className="flex items-center gap-2 mb-4 pb-3 border-b border-[#1a1a1a]">
                 <Icon name="Download" size={14} className="text-laser" />
                 <span className="font-oswald text-sm tracking-[0.15em] text-white uppercase">Экспорт</span>
@@ -570,79 +707,69 @@ export default function Index() {
                 </div>
               )}
 
-              <div className="space-y-2 mb-5">
+              <div className="space-y-2 mb-4">
                 {([
-                  { fmt: 'PNG' as ExportFormat, desc: 'Растровый, с фильтрами', icon: 'Image' },
-                  { fmt: 'BMP' as ExportFormat, desc: 'Растровый, без сжатия', icon: 'Image' },
-                  { fmt: 'DXF' as ExportFormat, desc: 'AutoCAD — векторные траектории', icon: 'Spline' },
-                  { fmt: 'LBRN2' as ExportFormat, desc: 'LightBurn — проект с настройками', icon: 'Zap' },
+                  { fmt: 'PNG'   as ExportFormat, desc: 'Растровый с фильтрами',          icon: 'Image'    },
+                  { fmt: 'BMP'   as ExportFormat, desc: 'Растровый, без сжатия',           icon: 'Image'    },
+                  { fmt: 'DXF'   as ExportFormat, desc: 'AutoCAD — векторные траектории',  icon: 'Spline'   },
+                  { fmt: 'LBRN2' as ExportFormat, desc: 'LightBurn проект с настройками',  icon: 'Zap'      },
                 ]).map(({ fmt, desc, icon }) => {
                   const isLoading = exporting === fmt;
-                  const isDone = exportDone === fmt;
+                  const isDone    = exportDone === fmt;
                   return (
                     <button
                       key={fmt}
                       onClick={() => exportFile(fmt)}
                       disabled={!imageFile || !!exporting}
                       className={`w-full flex items-center justify-between px-4 py-3 border transition-all group
-                        ${isDone ? 'border-green-700 bg-green-950/30' : ''}
-                        ${isLoading ? 'border-laser bg-[#1a0000]' : ''}
+                        ${isDone    ? 'border-green-700 bg-green-950/30'  : ''}
+                        ${isLoading ? 'border-laser bg-[#1a0000]'          : ''}
                         ${!isDone && !isLoading ? 'border-[#1e1e1e] hover:border-laser' : ''}
-                        ${!imageFile || !!exporting ? 'opacity-40 cursor-not-allowed' : 'cursor-pointer'}
+                        ${(!imageFile || !!exporting) ? 'opacity-40 cursor-not-allowed' : 'cursor-pointer'}
                       `}
                     >
                       <div className="flex items-center gap-3">
                         <div className={`w-8 h-8 border flex items-center justify-center transition-all
-                          ${isDone ? 'bg-green-900/40 border-green-700' : ''}
-                          ${isLoading ? 'bg-[#200000] border-laser animate-pulse-laser' : ''}
+                          ${isDone    ? 'bg-green-900/40 border-green-700'                         : ''}
+                          ${isLoading ? 'bg-[#200000] border-laser animate-pulse-laser'            : ''}
                           ${!isDone && !isLoading ? 'bg-[#111] border-[#1e1e1e] group-hover:border-laser' : ''}
                         `}>
-                          {isDone
-                            ? <Icon name="Check" size={14} className="text-green-400" />
-                            : isLoading
-                            ? <Icon name="Loader" size={14} className="text-laser animate-spin" />
-                            : <Icon name={icon} size={14} className="text-[#444] group-hover:text-laser transition-colors" />
-                          }
+                          {isDone    ? <Icon name="Check"  size={14} className="text-green-400" />                       :
+                           isLoading ? <Icon name="Loader" size={14} className="text-laser animate-spin" />              :
+                                       <Icon name={icon}   size={14} className="text-[#444] group-hover:text-laser transition-colors" />}
                         </div>
                         <div className="text-left">
-                          <div className={`font-oswald text-sm tracking-wider ${isDone ? 'text-green-400' : 'text-white'}`}>
-                            {fmt}
-                          </div>
-                          <div className="text-[10px] text-[#444]">
-                            {isDone ? '✓ Файл сохранён' : isLoading ? 'Генерация...' : desc}
-                          </div>
+                          <div className={`font-oswald text-sm tracking-wider ${isDone ? 'text-green-400' : 'text-white'}`}>{fmt}</div>
+                          <div className="text-[10px] text-[#444]">{isDone ? '✓ Файл сохранён' : isLoading ? 'Генерация...' : desc}</div>
                         </div>
                       </div>
-                      {!isLoading && !isDone && (
-                        <Icon name="ChevronRight" size={14} className="text-[#333] group-hover:text-laser transition-colors" />
-                      )}
+                      {!isLoading && !isDone && <Icon name="ChevronRight" size={14} className="text-[#333] group-hover:text-laser transition-colors" />}
                     </button>
                   );
                 })}
               </div>
 
-              {/* DXF info block */}
               <div className="bg-[#0a0a0a] border border-[#161616] p-3 mb-3">
                 <div className="flex items-center gap-2 mb-2">
-                  <Icon name="Info" size={11} className="text-laser flex-shrink-0" />
+                  <Icon name="Info" size={11} className="text-laser" />
                   <span className="section-label">Про форматы</span>
                 </div>
                 <p className="text-[10px] text-[#3a3a3a] leading-relaxed">
-                  <span className="text-[#555]">DXF</span> — горизонтальные линии по тёмным пикселям. Открывается в AutoCAD, CorelDRAW, Inkscape.<br />
-                  <span className="text-[#555]">LBRN2</span> — полноценный проект LightBurn с параметрами: мощность {engraveSettings.power}%, скорость {engraveSettings.speed} мм/с, {engraveSettings.dpi} DPI.
+                  <span className="text-[#555]">DXF</span> — линии по тёмным пикселям, открывается в AutoCAD, Inkscape.<br />
+                  <span className="text-[#555]">LBRN2</span> — проект LightBurn: {engraveSettings.power}% мощность, {engraveSettings.speed} мм/с, {engraveSettings.dpi} DPI.
                 </p>
               </div>
 
-              <div className="bg-[#0c0c0c] border border-[#1a1a1a] p-3 mb-4">
+              <div className="bg-[#0c0c0c] border border-[#1a1a1a] p-3">
                 <p className="section-label mb-2">Параметры экспорта</p>
                 <div className="space-y-1.5">
                   {[
                     { label: 'Разрешение', value: `${engraveSettings.dpi} DPI` },
-                    { label: 'Глубина цвета', value: params.bitDepth === 1 ? '1-bit (ч/б)' : '8-bit (серый)' },
-                    { label: 'Материал', value: currentMaterial.label },
-                    { label: 'Мощность', value: `${engraveSettings.power}%` },
-                    { label: 'Скорость', value: `${engraveSettings.speed} мм/с` },
-                    { label: 'Проходов', value: engraveSettings.passes },
+                    { label: 'Глубина',    value: params.bitDepth === 1 ? '1-bit (ч/б)' : '8-bit (серый)' },
+                    { label: 'Карта',      value: HEIGHT_MAP_PRESETS.find(h => h.id === params.heightMap)?.label },
+                    { label: 'Дизеринг',  value: params.bitDepth === 1 ? DITHER_MODES.find(d => d.id === params.dithering)?.label : '—' },
+                    { label: 'Мощность',   value: `${engraveSettings.power}%` },
+                    { label: 'Скорость',   value: `${engraveSettings.speed} мм/с` },
                   ].map(r => (
                     <div key={r.label} className="flex justify-between">
                       <span className="section-label">{r.label}</span>
@@ -651,18 +778,11 @@ export default function Index() {
                   ))}
                 </div>
               </div>
-
-              {/* Upload from cloud placeholder */}
-              <div className="border border-dashed border-[#1e1e1e] p-4 text-center">
-                <Icon name="Cloud" size={20} className="text-[#2a2a2a] mx-auto mb-2" />
-                <p className="section-label mb-1">Облачное хранилище</p>
-                <p className="text-[10px] text-[#2a2a2a]">Загрузка из облака — скоро</p>
-              </div>
             </div>
           )}
 
           {/* Bottom status */}
-          <div className="border-t border-[#1a1a1a] px-5 py-3 flex items-center justify-between">
+          <div className="mt-auto border-t border-[#1a1a1a] px-5 py-3 flex items-center justify-between">
             <div className="flex items-center gap-2">
               <div className={`w-1.5 h-1.5 rounded-full ${imageFile ? 'bg-laser animate-pulse-laser' : 'bg-[#2a2a2a]'}`} />
               <span className="text-[10px] font-mono text-[#444]">
@@ -676,12 +796,8 @@ export default function Index() {
         </aside>
       </div>
 
-      {/* Hidden file input */}
       <input
-        ref={fileInputRef}
-        type="file"
-        accept="image/*"
-        className="hidden"
+        ref={fileInputRef} type="file" accept="image/*" className="hidden"
         onChange={e => {
           const f = e.target.files?.[0];
           if (f) handleFile(f);
