@@ -1,13 +1,16 @@
 import { useState, useRef, useCallback, useEffect } from 'react';
 import Icon from '@/components/ui/icon';
 import { exportDXF, exportLBRN2 } from '@/lib/exporters';
-import { processImage, renderHeightMapPreview, type HeightMapPreset, type DitheringMode, type ProcessorParams } from '@/lib/imageProcessor';
+import { processImage, renderHeightMapPreview, cropCanvas, type HeightMapPreset, type DitheringMode, type GravureStyle, type ProcessorParams } from '@/lib/imageProcessor';
 
 // ── Types ──────────────────────────────────────────────────────────────────
 type Material = 'plywood' | 'wood' | 'steel' | 'ceramic' | 'glass' | 'leather';
 type ExportFormat = 'PNG' | 'BMP' | 'DXF' | 'LBRN2';
-type Tab = 'editor' | 'heightmap' | 'preview' | 'settings' | 'export';
+type Tab = 'editor' | 'retouch' | 'gravure' | 'heightmap' | 'preview' | 'settings' | 'export';
 type PreviewMode = 'result' | 'heatmap';
+
+interface CropRect { x: number; y: number; w: number; h: number }
+interface CropDrag { startX: number; startY: number; active: boolean }
 
 // ── Constants ─────────────────────────────────────────────────────────────
 const MATERIALS: { id: Material; label: string; color: string; texture: string }[] = [
@@ -35,6 +38,14 @@ const DITHER_MODES: { id: DitheringMode; label: string; desc: string }[] = [
   { id: 'atkinson',        label: 'Аткинсон',        desc: 'Резкий, чёткие края' },
 ];
 
+const GRAVURE_STYLES: { id: GravureStyle; label: string; desc: string }[] = [
+  { id: 'lines',      label: 'Линии',      desc: 'Классический линейный экран' },
+  { id: 'crosshatch', label: 'Штриховка',  desc: 'Перекрёстная штриховка' },
+  { id: 'dots',       label: 'Точки',      desc: 'Полутоновый растр (halftone)' },
+  { id: 'mezzotint',  label: 'Меццо-тинт', desc: 'Зернистая текстура, случайный паттерн' },
+  { id: 'woodcut',    label: 'Ксилография','desc': 'Имитация гравюры на дереве' },
+];
+
 const DEFAULT_PARAMS: ProcessorParams = {
   contrast: 0,
   brightness: 0,
@@ -47,6 +58,19 @@ const DEFAULT_PARAMS: ProcessorParams = {
   heightMapStrength: 70,
   gamma: 1.0,
   invert: false,
+  // retouch
+  skinSmoothing: 0,
+  skinTone: 60,
+  autoRetouch: false,
+  retouchStrength: 50,
+  noiseReduction: 0,
+  // gravure
+  gravureEnabled: false,
+  gravureStyle: 'lines',
+  gravureLineSpacing: 6,
+  gravureLineAngle: 45,
+  gravureDepth: 70,
+  gravureContrast: 50,
 };
 
 const ENGRAVE_SETTINGS = [
@@ -97,14 +121,15 @@ export default function Index() {
   const [exporting, setExporting] = useState<string | null>(null);
   const [exportDone, setExportDone] = useState<string | null>(null);
   const [previewMode, setPreviewMode] = useState<PreviewMode>('result');
+  const [cropMode, setCropMode] = useState(false);
+  const [cropRect, setCropRect] = useState<CropRect | null>(null);
+  const [cropDrag, setCropDrag] = useState<CropDrag>({ startX: 0, startY: 0, active: false });
+  const cropOverlayRef = useRef<HTMLDivElement>(null);
 
   const panStart = useRef({ x: 0, y: 0, ox: 0, oy: 0 });
   const fileInputRef = useRef<HTMLInputElement>(null);
-  // source canvas: raw image loaded here
   const sourceCanvasRef = useRef<HTMLCanvasElement>(null);
-  // output canvas: processed result shown on screen
   const outputCanvasRef = useRef<HTMLCanvasElement>(null);
-  // heatmap canvas
   const heatCanvasRef = useRef<HTMLCanvasElement>(null);
 
   const setParam = <K extends keyof ProcessorParams>(key: K, value: ProcessorParams[K]) =>
@@ -129,8 +154,39 @@ export default function Index() {
     setImageName(file.name);
     setPanOffset({ x: 0, y: 0 });
     setZoom(1);
+    setCropRect(null);
+    setCropMode(false);
     setTimeout(() => loadSource(url), 50);
   }, [loadSource]);
+
+  // Apply crop: commits cropRect to source canvas
+  const applyCrop = useCallback(() => {
+    if (!cropRect || !sourceCanvasRef.current) return;
+    const src = sourceCanvasRef.current;
+    const { x, y, w, h } = cropRect;
+    if (w < 4 || h < 4) return;
+    const cropped = cropCanvas(src, Math.round(x), Math.round(y), Math.round(w), Math.round(h));
+    src.width = cropped.width;
+    src.height = cropped.height;
+    src.getContext('2d')!.drawImage(cropped, 0, 0);
+    setCropRect(null);
+    setCropMode(false);
+    // trigger reprocess
+    if (outputCanvasRef.current) processImage(src, outputCanvasRef.current, params);
+    if (heatCanvasRef.current)   renderHeightMapPreview(src, heatCanvasRef.current, params);
+  }, [cropRect, params]);
+
+  // Crop overlay mouse handlers (pixel coords relative to displayed canvas)
+  const getCropCanvasCoords = (e: React.MouseEvent<HTMLDivElement>) => {
+    const el = e.currentTarget.getBoundingClientRect();
+    const src = sourceCanvasRef.current!;
+    const scaleX = src.width  / el.width;
+    const scaleY = src.height / el.height;
+    return {
+      x: (e.clientX - el.left) * scaleX,
+      y: (e.clientY - el.top)  * scaleY,
+    };
+  };
 
   const onDrop = useCallback((e: React.DragEvent) => {
     e.preventDefault();
@@ -246,6 +302,8 @@ export default function Index() {
         <nav className="flex gap-0 border border-[#1e1e1e]">
           {([
             { id: 'editor',    icon: 'SlidersHorizontal', label: 'РЕДАКТОР' },
+            { id: 'retouch',   icon: 'Sparkles',          label: 'РЕТУШЬ' },
+            { id: 'gravure',   icon: 'PenTool',           label: 'ГРАВЮРА' },
             { id: 'heightmap', icon: 'Mountain',          label: 'ВЫСОТЫ' },
             { id: 'preview',   icon: 'Eye',               label: 'МАТЕРИАЛ' },
             { id: 'settings',  icon: 'Settings2',         label: 'НАСТРОЙКИ' },
@@ -276,33 +334,58 @@ export default function Index() {
         {/* LEFT — Canvas */}
         <div className="flex-1 flex flex-col border-r border-[#1a1a1a]">
 
-          {/* Preview mode toggle */}
+          {/* Toolbar */}
           {imageFile && (
-            <div className="flex items-center gap-0 border-b border-[#181818] bg-[#0c0c0c] px-4 py-2">
-              <span className="section-label mr-4">РЕЖИМ ПРОСМОТРА:</span>
+            <div className="flex items-center gap-0 border-b border-[#181818] bg-[#0c0c0c] px-4 py-2 flex-wrap gap-y-1">
+              <span className="section-label mr-3">ВИД:</span>
               {([
-                { id: 'result',  label: 'Результат', icon: 'ScanLine' },
-                { id: 'heatmap', label: 'Карта высот', icon: 'Thermometer' },
+                { id: 'result',  label: 'Результат',   icon: 'ScanLine' },
+                { id: 'heatmap', label: 'Карта высот',  icon: 'Thermometer' },
               ] as const).map(m => (
-                <button
-                  key={m.id}
-                  onClick={() => setPreviewMode(m.id)}
+                <button key={m.id} onClick={() => { setPreviewMode(m.id); setCropMode(false); }}
                   className={`flex items-center gap-1.5 px-3 py-1 text-[10px] font-oswald tracking-wider mr-1 transition-all border ${
-                    previewMode === m.id
+                    previewMode === m.id && !cropMode
                       ? 'border-laser text-laser bg-[#150000]'
                       : 'border-[#1e1e1e] text-[#444] hover:border-[#333] hover:text-[#777]'
                   }`}
                 >
-                  <Icon name={m.icon} size={11} />
-                  {m.label.toUpperCase()}
+                  <Icon name={m.icon} size={11} />{m.label.toUpperCase()}
                 </button>
               ))}
-              {previewMode === 'heatmap' && (
+
+              <div className="w-px h-5 bg-[#1e1e1e] mx-2" />
+              <span className="section-label mr-2">ИНСТРУМЕНТЫ:</span>
+
+              {/* Crop toggle */}
+              <button
+                onClick={() => { setCropMode(c => !c); setCropRect(null); setPreviewMode('result'); }}
+                className={`flex items-center gap-1.5 px-3 py-1 text-[10px] font-oswald tracking-wider mr-1 transition-all border ${
+                  cropMode ? 'border-laser text-laser bg-[#150000]' : 'border-[#1e1e1e] text-[#444] hover:border-[#333] hover:text-[#777]'
+                }`}
+              >
+                <Icon name="Crop" size={11} />ОБРЕЗКА
+              </button>
+
+              {cropMode && cropRect && (
+                <>
+                  <button onClick={applyCrop} className="btn-laser px-3 py-1 text-[10px] mr-1">
+                    <Icon name="Check" size={10} className="inline mr-1" />ПРИМЕНИТЬ
+                  </button>
+                  <button onClick={() => setCropRect(null)} className="btn-ghost-steel px-3 py-1 text-[10px]">
+                    СБРОС
+                  </button>
+                </>
+              )}
+
+              {cropMode && (
+                <span className="text-[9px] text-[#444] ml-2 font-mono">
+                  {cropRect ? `${Math.round(cropRect.w)}×${Math.round(cropRect.h)} px` : 'нарисуйте область'}
+                </span>
+              )}
+
+              {previewMode === 'heatmap' && !cropMode && (
                 <div className="ml-auto flex items-center gap-1">
-                  {/* Thermal gradient legend */}
-                  <div className="w-24 h-2 rounded-sm" style={{
-                    background: 'linear-gradient(to right, #0a0a1e, #1414b4, #00c8b4, #c8dc00, #ff3c00)'
-                  }} />
+                  <div className="w-24 h-2" style={{ background: 'linear-gradient(to right, #0a0a1e, #1414b4, #00c8b4, #c8dc00, #ff3c00)' }} />
                   <span className="text-[9px] text-[#333] ml-1">0%→100%</span>
                 </div>
               )}
@@ -313,12 +396,12 @@ export default function Index() {
             className="flex-1 relative overflow-hidden bg-[#0c0c0c] select-none"
             onDrop={onDrop}
             onDragOver={e => e.preventDefault()}
-            onMouseDown={handleMouseDown}
-            onMouseMove={handleMouseMove}
-            onMouseUp={handleMouseUp}
-            onMouseLeave={handleMouseUp}
-            onWheel={handleWheel}
-            style={{ cursor: isPanning ? 'grabbing' : imageFile ? 'grab' : 'default' }}
+            onMouseDown={cropMode ? undefined : handleMouseDown}
+            onMouseMove={cropMode ? undefined : handleMouseMove}
+            onMouseUp={cropMode ? undefined : handleMouseUp}
+            onMouseLeave={cropMode ? undefined : handleMouseUp}
+            onWheel={cropMode ? undefined : handleWheel}
+            style={{ cursor: cropMode ? 'crosshair' : isPanning ? 'grabbing' : imageFile ? 'grab' : 'default' }}
           >
             {showGrid && (
               <div className="absolute inset-0 pointer-events-none opacity-[0.05]" style={{
@@ -350,28 +433,26 @@ export default function Index() {
 
             {imageFile && (
               <div className="absolute inset-0 flex items-center justify-center">
-                <div style={{ transform: `translate(${panOffset.x}px,${panOffset.y}px) scale(${zoom})`, transition: isPanning ? 'none' : 'transform 0.05s' }}>
-                  {/* Output canvas (always rendered but hidden when heatmap active) */}
+                <div
+                  style={{ transform: `translate(${panOffset.x}px,${panOffset.y}px) scale(${zoom})`, transition: isPanning ? 'none' : 'transform 0.05s', position: 'relative' }}
+                >
                   <canvas
                     ref={outputCanvasRef}
                     className="block max-w-none"
                     style={{
-                      display: previewMode === 'result' ? 'block' : 'none',
+                      display: previewMode === 'result' && !cropMode ? 'block' : cropMode ? 'block' : 'none',
                       imageRendering: params.bitDepth === 1 ? 'pixelated' : 'auto',
                       maxHeight: '70vh',
                     }}
                   />
-                  {/* Heatmap display */}
-                  {previewMode === 'heatmap' && (
+                  {previewMode === 'heatmap' && !cropMode && (
                     <canvas
                       ref={node => {
                         if (node && heatCanvasRef.current) {
-                          // Mirror heatmap canvas content onto this display node
                           const ctx = node.getContext('2d');
                           const src = heatCanvasRef.current;
                           if (ctx && src.width > 0) {
-                            node.width = src.width;
-                            node.height = src.height;
+                            node.width = src.width; node.height = src.height;
                             ctx.drawImage(src, 0, 0);
                           }
                         }
@@ -379,6 +460,63 @@ export default function Index() {
                       className="block max-w-none"
                       style={{ maxHeight: '70vh' }}
                     />
+                  )}
+
+                  {/* ── Crop overlay ── */}
+                  {cropMode && outputCanvasRef.current && (
+                    <div
+                      ref={cropOverlayRef}
+                      className="absolute inset-0"
+                      style={{ cursor: 'crosshair' }}
+                      onMouseDown={e => {
+                        const coords = getCropCanvasCoords(e);
+                        setCropDrag({ startX: coords.x, startY: coords.y, active: true });
+                        setCropRect(null);
+                      }}
+                      onMouseMove={e => {
+                        if (!cropDrag.active) return;
+                        const coords = getCropCanvasCoords(e);
+                        const x = Math.min(cropDrag.startX, coords.x);
+                        const y = Math.min(cropDrag.startY, coords.y);
+                        const w = Math.abs(coords.x - cropDrag.startX);
+                        const h = Math.abs(coords.y - cropDrag.startY);
+                        setCropRect({ x, y, w, h });
+                      }}
+                      onMouseUp={() => setCropDrag(d => ({ ...d, active: false }))}
+                    >
+                      {/* Dark overlay outside crop */}
+                      {cropRect && (() => {
+                        const cw = outputCanvasRef.current!.width;
+                        const ch = outputCanvasRef.current!.height;
+                        const pct = (v: number, total: number) => `${(v / total * 100).toFixed(2)}%`;
+                        return (
+                          <>
+                            <div className="absolute bg-black/60" style={{ left: 0, top: 0, width: pct(cropRect.x, cw), height: '100%' }} />
+                            <div className="absolute bg-black/60" style={{ left: pct(cropRect.x + cropRect.w, cw), top: 0, right: 0, height: '100%' }} />
+                            <div className="absolute bg-black/60" style={{ left: pct(cropRect.x, cw), top: 0, width: pct(cropRect.w, cw), height: pct(cropRect.y, ch) }} />
+                            <div className="absolute bg-black/60" style={{ left: pct(cropRect.x, cw), top: pct(cropRect.y + cropRect.h, ch), width: pct(cropRect.w, cw), bottom: 0 }} />
+                            {/* Crop border */}
+                            <div className="absolute border border-laser" style={{
+                              left: pct(cropRect.x, cw), top: pct(cropRect.y, ch),
+                              width: pct(cropRect.w, cw), height: pct(cropRect.h, ch),
+                              boxShadow: '0 0 8px rgba(232,0,10,0.5)',
+                            }}>
+                              {/* Rule of thirds */}
+                              <div className="absolute inset-0 pointer-events-none">
+                                <div className="absolute border-l border-white/10" style={{ left: '33.33%', top: 0, bottom: 0 }} />
+                                <div className="absolute border-l border-white/10" style={{ left: '66.66%', top: 0, bottom: 0 }} />
+                                <div className="absolute border-t border-white/10" style={{ top: '33.33%', left: 0, right: 0 }} />
+                                <div className="absolute border-t border-white/10" style={{ top: '66.66%', left: 0, right: 0 }} />
+                              </div>
+                              {/* Corners */}
+                              {[['top-0 left-0 border-t-2 border-l-2',''],['top-0 right-0 border-t-2 border-r-2',''],['bottom-0 left-0 border-b-2 border-l-2',''],['bottom-0 right-0 border-b-2 border-r-2','']].map(([cls], i) => (
+                                <div key={i} className={`absolute w-3 h-3 border-laser ${cls}`} />
+                              ))}
+                            </div>
+                          </>
+                        );
+                      })()}
+                    </div>
                   )}
                 </div>
               </div>
@@ -491,6 +629,179 @@ export default function Index() {
               <button onClick={() => setParams(DEFAULT_PARAMS)} className="btn-ghost-steel w-full py-2 text-xs mt-2">
                 <Icon name="RotateCcw" size={10} className="inline mr-1.5" />Сбросить всё
               </button>
+            </div>
+          )}
+
+          {/* ── RETOUCH ── */}
+          {tab === 'retouch' && (
+            <div className="p-5 animate-fade-in">
+              <div className="flex items-center gap-2 mb-4 pb-3 border-b border-[#1a1a1a]">
+                <Icon name="Sparkles" size={14} className="text-laser" />
+                <span className="font-oswald text-sm tracking-[0.15em] text-white uppercase">Ретушь</span>
+              </div>
+
+              {/* Auto retouch */}
+              <div className="bg-[#0a0a0a] border border-[#161616] p-3 mb-4">
+                <div className="flex items-center justify-between mb-2">
+                  <div>
+                    <div className="font-oswald text-xs text-white tracking-wider">Авторетушь</div>
+                    <div className="text-[9px] text-[#3a3a3a]">Авто-уровни + локальный контраст</div>
+                  </div>
+                  <button
+                    onClick={() => setParam('autoRetouch', !params.autoRetouch)}
+                    className={`w-10 h-5 relative transition-all flex-shrink-0 ${params.autoRetouch ? 'bg-laser' : 'bg-[#1e1e1e] border border-[#2e2e2e]'}`}
+                  >
+                    <div className={`absolute top-0.5 w-4 h-4 bg-white transition-all ${params.autoRetouch ? 'right-0.5' : 'left-0.5'}`} />
+                  </button>
+                </div>
+                {params.autoRetouch && (
+                  <Slider label="Интенсивность" value={params.retouchStrength} min={0} max={100} unit="%" onChange={v => setParam('retouchStrength', v)} />
+                )}
+              </div>
+
+              {/* Noise reduction */}
+              <Slider
+                label="Шумоподавление"
+                value={params.noiseReduction} min={0} max={100} unit="%"
+                onChange={v => setParam('noiseReduction', v)}
+              />
+
+              <div className="border-t border-[#1a1a1a] my-4" />
+
+              {/* Skin smoothing */}
+              <div className="mb-1">
+                <div className="flex items-center gap-2 mb-3">
+                  <Icon name="User" size={12} className="text-laser" />
+                  <span className="font-oswald text-xs text-white tracking-wider uppercase">Сглаживание кожи</span>
+                </div>
+                <p className="text-[10px] text-[#333] mb-3 leading-relaxed">
+                  Сохраняет детали (глаза, волосы) через тепловую маску — сглаживает только тёплые оттенки.
+                </p>
+              </div>
+
+              <Slider label="Сглаживание" value={params.skinSmoothing} min={0} max={100} unit="%" onChange={v => setParam('skinSmoothing', v)} />
+
+              {params.skinSmoothing > 0 && (
+                <div className="mb-4">
+                  <Slider
+                    label="Охват (тон кожи)"
+                    value={params.skinTone} min={0} max={100} unit="%"
+                    onChange={v => setParam('skinTone', v)}
+                  />
+                  <div className="flex gap-1 mt-1">
+                    <div className="text-[9px] text-[#333]">0% = все пиксели</div>
+                    <div className="ml-auto text-[9px] text-[#333]">100% = только кожа</div>
+                  </div>
+
+                  {/* Skin tone gradient */}
+                  <div className="mt-2 h-3 w-full relative">
+                    <div className="absolute inset-0" style={{
+                      background: 'linear-gradient(to right, #f5deb3, #d2a679, #c68642, #8d5524, #3d1a00)'
+                    }} />
+                    <div className="absolute top-0 h-full w-0.5 bg-laser" style={{ left: `${params.skinTone}%` }} />
+                  </div>
+                </div>
+              )}
+
+              <div className="border-t border-[#1a1a1a] my-4" />
+
+              <button
+                onClick={() => setParams(p => ({ ...p, skinSmoothing: 0, noiseReduction: 0, retouchStrength: 50, autoRetouch: false, skinTone: 60 }))}
+                className="btn-ghost-steel w-full py-2 text-xs"
+              >
+                <Icon name="RotateCcw" size={10} className="inline mr-1.5" />Сбросить ретушь
+              </button>
+            </div>
+          )}
+
+          {/* ── GRAVURE ── */}
+          {tab === 'gravure' && (
+            <div className="p-5 animate-fade-in">
+              <div className="flex items-center gap-2 mb-4 pb-3 border-b border-[#1a1a1a]">
+                <Icon name="PenTool" size={14} className="text-laser" />
+                <span className="font-oswald text-sm tracking-[0.15em] text-white uppercase">Гравюра</span>
+              </div>
+
+              <div className="bg-[#0a0a0a] border border-[#161616] p-3 mb-4">
+                <p className="text-[10px] text-[#3a3a3a] leading-relaxed">
+                  Имитирует классическую печатную гравюру: линии, точечный растр, меццо-тинт. Идеально для художественной гравировки.
+                </p>
+              </div>
+
+              <div className="flex items-center justify-between mb-4">
+                <span className="font-oswald text-sm text-white tracking-wider">Гравюра активна</span>
+                <button
+                  onClick={() => setParam('gravureEnabled', !params.gravureEnabled)}
+                  className={`w-10 h-5 relative transition-all ${params.gravureEnabled ? 'bg-laser' : 'bg-[#1e1e1e] border border-[#2e2e2e]'}`}
+                >
+                  <div className={`absolute top-0.5 w-4 h-4 bg-white transition-all ${params.gravureEnabled ? 'right-0.5' : 'left-0.5'}`} />
+                </button>
+              </div>
+
+              {params.gravureEnabled && (
+                <>
+                  <span className="section-label block mb-2">Стиль гравюры</span>
+                  <div className="flex flex-col gap-1.5 mb-4">
+                    {GRAVURE_STYLES.map(gs => (
+                      <button
+                        key={gs.id}
+                        onClick={() => setParam('gravureStyle', gs.id)}
+                        className={`text-left px-3 py-2 border transition-all ${
+                          params.gravureStyle === gs.id
+                            ? 'border-laser bg-[#150000]'
+                            : 'border-[#1a1a1a] hover:border-[#2e2e2e]'
+                        }`}
+                      >
+                        <div className="flex items-center justify-between">
+                          <span className={`font-oswald text-xs tracking-wider ${params.gravureStyle === gs.id ? 'text-laser' : 'text-[#888]'}`}>
+                            {gs.label}
+                          </span>
+                          {params.gravureStyle === gs.id && <Icon name="Check" size={10} className="text-laser" />}
+                        </div>
+                        <div className="text-[9px] text-[#3a3a3a] mt-0.5">{gs.desc}</div>
+                      </button>
+                    ))}
+                  </div>
+
+                  <div className="border-t border-[#1a1a1a] my-3" />
+
+                  {params.gravureStyle !== 'mezzotint' && (
+                    <>
+                      <Slider
+                        label="Шаг линий / точек"
+                        value={params.gravureLineSpacing} min={2} max={20} unit=" px"
+                        onChange={v => setParam('gravureLineSpacing', v)}
+                      />
+                      {(params.gravureStyle === 'lines' || params.gravureStyle === 'crosshatch' || params.gravureStyle === 'woodcut') && (
+                        <Slider
+                          label="Угол линий"
+                          value={params.gravureLineAngle} min={0} max={180} unit="°"
+                          onChange={v => setParam('gravureLineAngle', v)}
+                        />
+                      )}
+                    </>
+                  )}
+                  <Slider label="Глубина эффекта" value={params.gravureDepth}    min={0} max={100} unit="%" onChange={v => setParam('gravureDepth', v)} />
+                  <Slider label="Контраст"         value={params.gravureContrast} min={0} max={100} unit="%" onChange={v => setParam('gravureContrast', v)} />
+
+                  {/* Style preview hint */}
+                  <div className="bg-[#0c0c0c] border border-[#181818] p-2 mt-2">
+                    <div className="section-label mb-1">Текущий режим</div>
+                    <div className="font-oswald text-laser text-xs tracking-wider">
+                      {GRAVURE_STYLES.find(g => g.id === params.gravureStyle)?.label} · {params.gravureLineSpacing}px · {params.gravureDepth}%
+                    </div>
+                  </div>
+                </>
+              )}
+
+              {!params.gravureEnabled && (
+                <button
+                  onClick={() => setParam('gravureEnabled', true)}
+                  className="btn-laser w-full py-2.5 text-xs mt-2"
+                >
+                  <Icon name="PenTool" size={12} className="inline mr-2" />Включить гравюру
+                </button>
+              )}
             </div>
           )}
 

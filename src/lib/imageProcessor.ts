@@ -1,28 +1,44 @@
 // ── Image Processor for Laser Engraving ──────────────────────────────────
-// Handles: grayscale, height maps, Floyd-Steinberg dithering, sharpening
+// Handles: grayscale, height maps, Floyd-Steinberg dithering, sharpening,
+//          skin smoothing, auto-retouch, engraving (gravure) effect
 
 export type HeightMapPreset =
-  | 'linear'      // simple luminance → depth
-  | 'inverted'    // dark = deep, light = shallow
-  | 'gamma'       // gamma-corrected depth
-  | 'relief'      // edge-enhanced, 3D relief feel
-  | 'emboss'      // emboss/bump-map effect
-  | 'solarize'    // sinusoidal wave mapping
+  | 'linear'
+  | 'inverted'
+  | 'gamma'
+  | 'relief'
+  | 'emboss'
+  | 'solarize'
 
 export type DitheringMode = 'none' | 'floyd-steinberg' | 'atkinson' | 'threshold'
 
+export type GravureStyle = 'lines' | 'crosshatch' | 'dots' | 'mezzotint' | 'woodcut'
+
 export interface ProcessorParams {
-  contrast: number       // -100..100
-  brightness: number     // -100..100
-  sharpness: number      // 0..100
-  grayscale: number      // 0..100
-  threshold: number      // 0..255
+  contrast: number           // -100..100
+  brightness: number         // -100..100
+  sharpness: number          // 0..100
+  grayscale: number          // 0..100
+  threshold: number          // 0..255
   bitDepth: 1 | 8
   dithering: DitheringMode
   heightMap: HeightMapPreset
   heightMapStrength: number  // 0..100
-  gamma: number          // 0.1..3.0
+  gamma: number              // 0.1..3.0
   invert: boolean
+  // Skin & retouch
+  skinSmoothing: number      // 0..100
+  skinTone: number           // 0..100 — skin tone bias
+  autoRetouch: boolean
+  retouchStrength: number    // 0..100
+  noiseReduction: number     // 0..100
+  // Gravure / engraving effect
+  gravureEnabled: boolean
+  gravureStyle: GravureStyle
+  gravureLineSpacing: number // 2..20 px
+  gravureLineAngle: number   // 0..180 deg
+  gravureDepth: number       // 0..100
+  gravureContrast: number    // 0..100
 }
 
 // ── Clamp ─────────────────────────────────────────────────────────────────
@@ -223,6 +239,231 @@ function simpleThreshold(gray: Float32Array, threshold: number): Uint8ClampedArr
   return out
 }
 
+// ── Gaussian blur (for skin smoothing) ────────────────────────────────────
+function gaussianBlur(gray: Float32Array, w: number, h: number, radius: number): Float32Array {
+  if (radius <= 0) return gray
+  const r = Math.min(Math.round(radius), 10)
+  const kernel: number[] = []
+  const sigma = r / 2.5
+  let sum = 0
+  for (let i = -r; i <= r; i++) {
+    const v = Math.exp(-(i * i) / (2 * sigma * sigma))
+    kernel.push(v)
+    sum += v
+  }
+  for (let i = 0; i < kernel.length; i++) kernel[i] /= sum
+
+  // Horizontal pass
+  const tmp = new Float32Array(gray.length)
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      let acc = 0
+      for (let k = -r; k <= r; k++) {
+        const xi = Math.max(0, Math.min(w - 1, x + k))
+        acc += gray[y * w + xi] * kernel[k + r]
+      }
+      tmp[y * w + x] = acc
+    }
+  }
+  // Vertical pass
+  const out = new Float32Array(gray.length)
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      let acc = 0
+      for (let k = -r; k <= r; k++) {
+        const yi = Math.max(0, Math.min(h - 1, y + k))
+        acc += tmp[yi * w + x] * kernel[k + r]
+      }
+      out[y * w + x] = acc
+    }
+  }
+  return out
+}
+
+// ── Skin smoothing: bilateral-like blend of blurred + original ────────────
+// Works on RGBA data in-place (preserves edges via luminance mask)
+function applySkinSmoothing(
+  data: Uint8ClampedArray,
+  w: number, h: number,
+  smoothing: number,
+  skinTone: number
+): void {
+  if (smoothing <= 0) return
+  const s = smoothing / 100
+  const toneBias = skinTone / 100  // 0 = all pixels, 1 = only warm tones
+
+  // Build luminance float arrays for R, G, B channels separately
+  const rBuf = new Float32Array(w * h)
+  const gBuf = new Float32Array(w * h)
+  const bBuf = new Float32Array(w * h)
+  for (let i = 0; i < w * h; i++) {
+    rBuf[i] = data[i * 4]
+    gBuf[i] = data[i * 4 + 1]
+    bBuf[i] = data[i * 4 + 2]
+  }
+
+  const radius = Math.round(2 + s * 6)
+  const rBlur = gaussianBlur(rBuf, w, h, radius)
+  const gBlur = gaussianBlur(gBuf, w, h, radius)
+  const bBlur = gaussianBlur(bBuf, w, h, radius)
+
+  for (let i = 0; i < w * h; i++) {
+    const r = data[i * 4]
+    const g = data[i * 4 + 1]
+    const b = data[i * 4 + 2]
+
+    // Skin tone mask: warm = r>g, r>b, moderate brightness
+    const warmth = Math.max(0, (r - g) / 255 + (r - b) / 255) / 2
+    const lum = (r + g + b) / 765
+    const inRange = lum > 0.15 && lum < 0.95
+    const skinMask = inRange ? clamp(warmth * 2, 0, 1) * toneBias + (1 - toneBias) : (1 - toneBias)
+    const blend = s * skinMask
+
+    data[i * 4]     = clamp(r + (rBlur[i] - r) * blend)
+    data[i * 4 + 1] = clamp(g + (gBlur[i] - g) * blend)
+    data[i * 4 + 2] = clamp(b + (bBlur[i] - b) * blend)
+  }
+}
+
+// ── Auto retouch: histogram stretch + local contrast + noise reduction ─────
+function applyAutoRetouch(
+  data: Uint8ClampedArray,
+  w: number, h: number,
+  strength: number,
+  noiseReduction: number
+): void {
+  const s = strength / 100
+
+  // 1. Histogram analysis for auto-levels
+  const hist = new Array(256).fill(0)
+  for (let i = 0; i < w * h; i++) {
+    const lum = Math.round(0.299 * data[i*4] + 0.587 * data[i*4+1] + 0.114 * data[i*4+2])
+    hist[lum]++
+  }
+  const total = w * h
+  const lo_cut = total * 0.005
+  const hi_cut = total * 0.995
+  let lo = 0, hi = 255, acc = 0
+  for (let v = 0; v < 256; v++) { acc += hist[v]; if (acc >= lo_cut) { lo = v; break } }
+  acc = 0
+  for (let v = 255; v >= 0; v--) { acc += hist[v]; if (acc >= (total - hi_cut)) { hi = v; break } }
+  const range = hi - lo || 1
+
+  // 2. Apply auto levels + local contrast (Unsharp Mask style via luminance)
+  const gray = new Float32Array(w * h)
+  for (let i = 0; i < w * h; i++) {
+    gray[i] = 0.299 * data[i*4] + 0.587 * data[i*4+1] + 0.114 * data[i*4+2]
+  }
+
+  // Noise reduction via mild blur
+  const nr = noiseReduction / 100
+  const blurred = nr > 0 ? gaussianBlur(gray, w, h, nr * 3) : gray
+
+  for (let i = 0; i < w * h; i++) {
+    const r0 = data[i*4], g0 = data[i*4+1], b0 = data[i*4+2]
+
+    // Auto levels
+    const rL = clamp(Math.round((r0 - lo) / range * 255))
+    const gL = clamp(Math.round((g0 - lo) / range * 255))
+    const bL = clamp(Math.round((b0 - lo) / range * 255))
+
+    // Noise reduction blend
+    const nr_blend = 1 - nr
+    const lum_orig = gray[i]
+    const lum_blur = blurred[i]
+    const nr_ratio = lum_orig > 0 ? (lum_orig * nr_blend + lum_blur * nr) / lum_orig : 1
+
+    data[i*4]   = clamp(r0 + (rL * nr_ratio - r0) * s)
+    data[i*4+1] = clamp(g0 + (gL * nr_ratio - g0) * s)
+    data[i*4+2] = clamp(b0 + (bL * nr_ratio - b0) * s)
+  }
+}
+
+// ── Gravure / engraving effect ─────────────────────────────────────────────
+// Renders the image using classic printmaking line-screen techniques
+export function applyGravure(
+  gray: Float32Array,
+  w: number, h: number,
+  style: GravureStyle,
+  spacing: number,
+  angle: number,
+  depth: number,
+  contrast: number
+): Float32Array {
+  const out = new Float32Array(w * h)
+  const d = depth / 100
+  const c = 1 + contrast / 50  // contrast multiplier
+  const rad = (angle * Math.PI) / 180
+  const cosA = Math.cos(rad)
+  const sinA = Math.sin(rad)
+
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const idx = y * w + x
+      const src = clamp(((gray[idx] / 255 - 0.5) * c + 0.5) * 255) / 255
+
+      // Rotate coordinates for line angle
+      const rx = x * cosA + y * sinA
+      const ry = -x * sinA + y * cosA
+
+      let pattern = 0
+
+      if (style === 'lines') {
+        // Classic horizontal line screen: line width ∝ luminance
+        const pos = ((ry % spacing) + spacing) % spacing
+        const lineW = src * spacing * 0.9
+        pattern = pos < lineW ? 1 : 0
+      } else if (style === 'crosshatch') {
+        // Two sets of lines at angle and angle+90
+        const rx2 = x * cosA - y * sinA
+        const ry2 = x * sinA + y * cosA
+        const pos1 = ((ry % spacing) + spacing) % spacing
+        const pos2 = ((ry2 % spacing) + spacing) % spacing
+        const lw = src * spacing * 0.6
+        pattern = (pos1 < lw || pos2 < lw) ? 1 : 0
+      } else if (style === 'dots') {
+        // Halftone dot screen
+        const cx = ((rx % spacing) + spacing) % spacing - spacing / 2
+        const cy = ((ry % spacing) + spacing) % spacing - spacing / 2
+        const r = Math.sqrt(cx * cx + cy * cy)
+        const maxR = spacing * 0.48
+        pattern = r < maxR * src ? 1 : 0
+      } else if (style === 'mezzotint') {
+        // Random grain modulated by luminance (pseudo-random via hash)
+        const hash = Math.sin(x * 127.1 + y * 311.7) * 43758.5453
+        const noise = hash - Math.floor(hash)
+        pattern = noise < src ? 1 : 0
+      } else if (style === 'woodcut') {
+        // Variable-width lines with edge emphasis (high contrast)
+        const pos = ((ry % spacing) + spacing) % spacing
+        // Edge detect contribution
+        const above = idx >= w ? gray[idx - w] / 255 : src
+        const below = idx < (h-1)*w ? gray[idx + w] / 255 : src
+        const edge = Math.abs(src - above) + Math.abs(src - below)
+        const lw = Math.min(spacing - 1, (src + edge * 2) * spacing * 0.85)
+        pattern = pos < lw ? 1 : 0
+      }
+
+      // Blend gravure pattern with original
+      out[idx] = clamp(((1 - d) * src + d * pattern) * 255)
+    }
+  }
+  return out
+}
+
+// ── Crop canvas utility ────────────────────────────────────────────────────
+export function cropCanvas(
+  src: HTMLCanvasElement,
+  x: number, y: number,
+  cw: number, ch: number
+): HTMLCanvasElement {
+  const out = document.createElement('canvas')
+  out.width  = cw
+  out.height = ch
+  out.getContext('2d')!.drawImage(src, x, y, cw, ch, 0, 0, cw, ch)
+  return out
+}
+
 // ── Main processor: takes source canvas, writes to output canvas ──────────
 export function processImage(
   sourceCanvas: HTMLCanvasElement,
@@ -255,34 +496,50 @@ export function processImage(
   // 2. Precise contrast + brightness on pixel level
   applyContrastBrightness(rawData.data, p.contrast * 0.5, p.brightness * 0.5)
 
-  // 3. Extract grayscale float buffer
+  // 3. Auto retouch (works on RGBA before grayscale conversion)
+  if (p.autoRetouch && p.retouchStrength > 0) {
+    applyAutoRetouch(rawData.data, w, h, p.retouchStrength, p.noiseReduction)
+  } else if (p.noiseReduction > 0) {
+    applyAutoRetouch(rawData.data, w, h, 0, p.noiseReduction)
+  }
+
+  // 4. Skin smoothing (on color data before grayscale)
+  if (p.skinSmoothing > 0) {
+    applySkinSmoothing(rawData.data, w, h, p.skinSmoothing, p.skinTone)
+  }
+
+  // 5. Extract grayscale float buffer
   let gray = toGrayFloat(rawData.data, w, h)
 
-  // 4. Gamma
+  // 6. Gamma
   if (Math.abs(p.gamma - 1) > 0.01) {
     applyGamma(gray, p.gamma)
   }
 
-  // 5. Sharpening
+  // 7. Sharpening
   if (p.sharpness > 0) {
     gray = sharpen(gray, w, h, p.sharpness)
   }
 
-  // 6. Invert
+  // 8. Invert
   if (p.invert) {
     for (let i = 0; i < gray.length; i++) gray[i] = 255 - gray[i]
   }
 
-  // 7. Height map transform
+  // 9. Height map transform
   if (p.heightMap !== 'linear' && p.heightMapStrength > 0) {
     gray = applyHeightMap(gray, p.heightMap, p.heightMapStrength)
   }
 
-  // 8. Final output
+  // 10. Gravure effect
+  if (p.gravureEnabled && p.gravureDepth > 0) {
+    gray = applyGravure(gray, w, h, p.gravureStyle, p.gravureLineSpacing, p.gravureLineAngle, p.gravureDepth, p.gravureContrast)
+  }
+
+  // 11. Final output
   const outData = outCtx.createImageData(w, h)
 
   if (p.bitDepth === 1) {
-    // Dithering modes
     let mono: Uint8ClampedArray
     if (p.dithering === 'floyd-steinberg') {
       mono = floydSteinberg(gray, w, h, p.threshold)
@@ -298,7 +555,6 @@ export function processImage(
       outData.data[i*4+3] = 255
     }
   } else {
-    // 8-bit grayscale — write height map as luminance
     for (let i = 0; i < w * h; i++) {
       const v = clamp(Math.round(gray[i]))
       outData.data[i*4]   = v
